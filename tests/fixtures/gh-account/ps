@@ -1,0 +1,53 @@
+#!/bin/sh
+
+# Delegating ps fixture for process-group enumeration failure injection.
+set -u
+
+real_ps=${FAKE_PS_REAL:?FAKE_PS_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+
+if [ -e "$state_dir/signal_before_child_publication" ] && \
+   [ "${1:-}" = -o ] && [ "${2:-}" = lstart= ] && [ "${3:-}" = -p ] && \
+   [ -d "$XDG_RUNTIME_DIR/operation.lock" ]; then
+  router_pid=$(sed -n '1p' "$XDG_RUNTIME_DIR/operation.lock/owner.pid" 2>/dev/null || true)
+  inspected_pid=${4:-}
+  if [ -n "$router_pid" ] && [ "$inspected_pid" != "$router_pid" ]; then
+    registration_count=$(sed -n '1p' "$state_dir/registration_count" 2>/dev/null || true)
+    case "$registration_count" in ''|*[!0-9]*) registration_count=0 ;; esac
+    registration_count=$((registration_count + 1))
+    printf '%s\n' "$registration_count" >"$state_dir/registration_count"
+    signal_on=$(sed -n '1p' "$state_dir/signal_before_child_publication" 2>/dev/null || true)
+    case "$signal_on" in ''|*[!0-9]*) signal_on=1 ;; esac
+    if [ "$registration_count" -eq "$signal_on" ]; then
+      printf '%s\n' "$inspected_pid" >"$state_dir/registration_supervisor.pid"
+      : >"$state_dir/registration_signal_injected"
+      kill -TERM "$router_pid" 2>/dev/null || true
+    fi
+  fi
+fi
+
+if [ -e "$state_dir/fork_after_snapshot" ] && [ "${1:-}" = -axo ] && \
+   [ ! -e "$state_dir/fork_snapshot_hidden" ]; then
+  coordinator_pid=$(sed -n '1p' "$state_dir/fork.coordinator.pid" 2>/dev/null || true)
+  if [ -n "$coordinator_pid" ]; then
+    "$real_ps" "$@" | awk -v hidden="$coordinator_pid" '$1 != hidden { print }'
+    snapshot_status=$?
+    [ "$snapshot_status" -eq 0 ] || exit "$snapshot_status"
+    : >"$state_dir/fork_snapshot_hidden"
+    : >"$state_dir/fork.release"
+    exit 0
+  fi
+fi
+
+if [ -e "$state_dir/fail_group_enumeration_once" ] && [ "${1:-}" = -axo ]; then
+  rm -f "$state_dir/fail_group_enumeration_once"
+  : >"$state_dir/group_enumeration_failed_once"
+  exit 91
+fi
+
+if [ -e "$state_dir/fail_group_enumeration" ] && [ "${1:-}" = -axo ]; then
+  : >"$state_dir/group_enumeration_failed"
+  exit 91
+fi
+
+exec "$real_ps" "$@"

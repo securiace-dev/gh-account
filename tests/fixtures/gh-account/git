@@ -1,0 +1,75 @@
+#!/bin/sh
+
+# Delegating Git fixture. Normal invocations use the host Git binary; routed
+# transport tests can opt in to a secret-free observation of the active gh user.
+set -u
+
+real_git=${FAKE_GIT_REAL:?FAKE_GIT_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+call_log=${FAKE_GH_LOG:-$state_dir/calls.log}
+
+if [ -e "$state_dir/pause_bound_read" ]; then
+  bound_read_match=false
+  bound_read_previous=
+  for argument in "$@"; do
+    if [ "$bound_read_previous" = --get ] && [ "$argument" = github.account ]; then
+      bound_read_match=true
+      break
+    fi
+    bound_read_previous=$argument
+  done
+  if [ "$bound_read_match" = true ] && \
+     mv "$state_dir/pause_bound_read" "$state_dir/pause_bound_read.consumed" 2>/dev/null; then
+    bound_read_output=$("$real_git" "$@" 2>/dev/null)
+    bound_read_status=$?
+    : >"$state_dir/bound_read_ready"
+    bound_read_attempt=0
+    while [ ! -e "$state_dir/release_bound_read" ]; do
+      bound_read_attempt=$((bound_read_attempt + 1))
+      [ "$bound_read_attempt" -lt 1000 ] || exit 98
+      sleep 0.01
+    done
+    [ -z "$bound_read_output" ] || printf '%s\n' "$bound_read_output"
+    exit "$bound_read_status"
+  fi
+fi
+
+transport=
+for argument in "$@"; do
+  case "$argument" in
+    fetch|pull|push|ls-remote) transport=$argument; break ;;
+  esac
+done
+
+if [ -n "$transport" ] && [ -e "$state_dir/intercept_git_transport" ]; then
+  active=$(sed -n '1p' "$state_dir/active" 2>/dev/null || true)
+  if [ -e "$state_dir/require_hooks_disabled" ]; then
+    hooks_disabled=false
+    previous=
+    for argument in "$@"; do
+      if [ "$previous" = -c ] && [ "$argument" = core.hooksPath=/dev/null ]; then
+        hooks_disabled=true
+      fi
+      previous=$argument
+    done
+    if [ "$hooks_disabled" = false ]; then
+      printf '%s\n' "$active" >"$state_dir/hook_canary"
+      exit 97
+    fi
+  fi
+  if [ -e "$state_dir/block_git_transport" ]; then
+    printf '%s\n' "$$" >"$state_dir/git_transport.pid"
+    : >"$state_dir/git_transport.ready"
+    transport_wait=0
+    while [ ! -e "$state_dir/release_git_transport" ]; do
+      transport_wait=$((transport_wait + 1))
+      [ "$transport_wait" -lt 3000 ] || exit 96
+      sleep 0.01
+    done
+  fi
+  printf 'git %s %s\n' "$transport" "$active" >>"$call_log"
+  transport_exit=$(sed -n '1p' "$state_dir/git_transport_exit" 2>/dev/null || true)
+  exit "${transport_exit:-0}"
+fi
+
+exec "$real_git" "$@"

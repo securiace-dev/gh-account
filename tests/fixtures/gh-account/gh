@@ -1,0 +1,409 @@
+#!/bin/sh
+
+# Stateful, secret-safe GitHub CLI fake for gh-account behavioral tests.
+# All mutable state is kept below FAKE_GH_STATE_DIR.
+set -u
+
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+call_log=${FAKE_GH_LOG:-$state_dir/calls.log}
+
+read_file() {
+  if [ -r "$1" ]; then
+    cat "$1"
+  fi
+}
+
+increment_counter() {
+  counter_name=$1
+  counter_value=$(read_file "$state_dir/$counter_name")
+  case "$counter_value" in ''|*[!0-9]*) counter_value=0 ;; esac
+  counter_value=$((counter_value + 1))
+  printf '%s\n' "$counter_value" >"$state_dir/$counter_name"
+  printf '%s\n' "$counter_value"
+}
+
+block_resistant_probe() {
+  probe_name=$1
+  printf '%s\n' "$$" >"$state_dir/probe.$probe_name.pid"
+  : >"$state_dir/probe.$probe_name.ready"
+  trap '' HUP INT TERM
+  while :; do
+    sleep 1
+  done
+}
+
+account_state() {
+  value=$(read_file "$state_dir/account.$1.state")
+  printf '%s\n' "${value:-success}"
+}
+
+account_source() {
+  value=$(read_file "$state_dir/account.$1.source")
+  printf '%s\n' "${value:-keyring}"
+}
+
+account_scopes_json() {
+  scopes=$(read_file "$state_dir/account.$1.scopes")
+  scopes=${scopes:-repo}
+  old_ifs=$IFS
+  IFS=,
+  first=true
+  printf '['
+  for scope in $scopes; do
+    if [ "$first" = true ]; then
+      first=false
+    else
+      printf ','
+    fi
+    printf '"%s"' "$scope"
+  done
+  IFS=$old_ifs
+  printf ']'
+}
+
+write_status_json() {
+  active=$(read_file "$state_dir/active")
+  first=true
+  printf '{"hosts":{"github.com":['
+  while IFS= read -r login; do
+    [ -n "$login" ] || continue
+    if [ "$first" = true ]; then
+      first=false
+    else
+      printf ','
+    fi
+    is_active=false
+    [ "$login" = "$active" ] && is_active=true
+    printf '{"active":%s,"host":"github.com","login":"%s","scopes":' "$is_active" "$login"
+    account_scopes_json "$login"
+    printf ',"state":"%s","tokenSource":"%s"}' \
+      "$(account_state "$login")" "$(account_source "$login")"
+  done <"$state_dir/accounts"
+  printf ']}}\n'
+}
+
+find_user_arg() {
+  found=
+  previous=
+  for argument in "$@"; do
+    if [ "$previous" = --user ] || [ "$previous" = -u ]; then
+      found=$argument
+      break
+    fi
+    previous=$argument
+  done
+  printf '%s\n' "$found"
+}
+
+log_family() {
+  # Log only the allowlisted command family and controlled login. Never log
+  # arbitrary arguments because they may contain credentials or hostile text.
+  family=$1
+  detail=${2:-}
+  if [ -n "$detail" ]; then
+    printf '%s %s\n' "$family" "$detail" >>"$call_log"
+  else
+    printf '%s\n' "$family" >>"$call_log"
+  fi
+}
+
+command_name=${1:-}
+subcommand=${2:-}
+
+case "$command_name:$subcommand" in
+  auth:status)
+    log_family 'auth status'
+    status_call=$(increment_counter auth_status.count)
+    block_status_call=$(read_file "$state_dir/block_auth_status_call")
+    if [ -n "$block_status_call" ] && [ "$status_call" -eq "$block_status_call" ]; then
+      block_resistant_probe auth-status
+    fi
+    if [ -r "$state_dir/status_exit" ]; then
+      status_exit=$(read_file "$state_dir/status_exit")
+      if [ "${status_exit:-0}" -ne 0 ]; then
+        read_file "$state_dir/status_error" >&2
+        exit "$status_exit"
+      fi
+    fi
+    if [ -e "$state_dir/status_malformed" ]; then
+      printf '{not-json\n'
+      exit 0
+    fi
+    if [ -e "$state_dir/status_empty_hosts" ]; then
+      printf '{"hosts":{}}\n'
+      exit 0
+    fi
+    for argument in "$@"; do
+      case "$argument" in
+        --show-token|--show-token=*)
+          printf 'Token: %s\n' "$(read_file "$state_dir/token_canary")"
+          exit 0
+          ;;
+        --*) ;;
+        -t|-t=*|-*t*)
+          printf 'Token: %s\n' "$(read_file "$state_dir/token_canary")"
+          exit 0
+          ;;
+      esac
+    done
+    write_status_json
+    ;;
+
+  auth:switch)
+    user=$(find_user_arg "$@")
+    log_family 'auth switch' "$user"
+    fail_user=$(read_file "$state_dir/switch_fail_user")
+    if [ -n "$fail_user" ] && [ "$user" = "$fail_user" ]; then
+      printf 'fake gh: switch failed for %s\n' "$user" >&2
+      exit 1
+    fi
+    printf '%s\n' "$user" >"$state_dir/active"
+    if [ "$user" = alice ] && [ -e "$state_dir/record_restore_lock_order" ]; then
+      if [ -d "$XDG_RUNTIME_DIR/operation.lock" ] && \
+         [ ! -L "$XDG_RUNTIME_DIR/operation.lock" ]; then
+        : >"$state_dir/restore_observed_while_locked"
+      else
+        : >"$state_dir/restore_observed_after_unlock"
+      fi
+    fi
+    corrupt_user=$(read_file "$state_dir/corrupt_restore_quarantine_user")
+    if [ -n "$corrupt_user" ] && [ "$user" = "$corrupt_user" ]; then
+      rm -f "$XDG_RUNTIME_DIR/github.com/restore.pending" 2>/dev/null || true
+      mkdir "$XDG_RUNTIME_DIR/github.com/restore.pending" 2>/dev/null || true
+    fi
+    ;;
+
+  auth:refresh)
+    user=$(find_user_arg "$@")
+    [ -n "$user" ] || user=$(read_file "$state_dir/active")
+    log_family 'auth refresh' "$user"
+    if [ -e "$state_dir/refresh_ctrl_c_mutation_window" ]; then
+      [ -t 0 ] && [ -t 1 ] || exit 96
+      (
+        trap '' HUP INT TERM
+        while :; do sleep 1; done
+      ) &
+      ctrl_c_descendant_pid=$!
+      printf '%s\n' "$ctrl_c_descendant_pid" >"$state_dir/ctrl_c.descendant.pid"
+      : >"$state_dir/ctrl_c.descendant.ready"
+      printf 'native-auth-cancel-ready\n'
+      sleep 0.4
+      : >"$state_dir/ctrl_c_completion_mutated"
+      printf 'success\n' >"$state_dir/account.$user.state"
+      wait "$ctrl_c_descendant_pid"
+    fi
+    if [ -e "$state_dir/refresh_require_pty_stdin" ]; then
+      [ -t 0 ] && [ -t 1 ] || exit 96
+      printf 'native-auth-input-ready\n'
+      IFS= read -r refresh_input || exit 97
+      [ "$refresh_input" = PTY_STDIN_CANARY_4f6b ] || exit 98
+      printf 'pty-round-trip:%s\n' "$refresh_input"
+      : >"$state_dir/refresh_pty_stdin_ok"
+    fi
+    refresh_exit=$(read_file "$state_dir/refresh_exit")
+    if [ -n "$refresh_exit" ] && [ "$refresh_exit" -ne 0 ]; then
+      exit "$refresh_exit"
+    fi
+    printf 'success\n' >"$state_dir/account.$user.state"
+    ;;
+
+  auth:setup-git)
+    log_family 'auth setup-git'
+    if [ -e "$state_dir/setup_git_edit_live_config" ]; then
+      "$FAKE_GIT_REAL" config --file "$HOME/.gitconfig" external.concurrent true
+    fi
+    helper_key=credential.https://github.com.helper
+    if [ -e "$state_dir/setup_git_signal_parent" ]; then
+      git config --global --unset-all "$helper_key" >/dev/null 2>&1 || true
+      git config --global --add "$helper_key" '!partial-gh-helper'
+      : >"$state_dir/setup_git_signal_ready"
+      kill -TERM "$PPID"
+      sleep 30
+      exit 1
+    fi
+    if [ -e "$state_dir/setup_git_partial_failure" ]; then
+      git config --global --unset-all "$helper_key" >/dev/null 2>&1 || true
+      git config --global --add "$helper_key" '!partial-gh-helper'
+      exit 1
+    fi
+    setup_git_exit=$(read_file "$state_dir/setup_git_exit")
+    if [ -n "$setup_git_exit" ] && [ "$setup_git_exit" -ne 0 ]; then
+      exit "$setup_git_exit"
+    fi
+    git config --global --unset-all "$helper_key" >/dev/null 2>&1 || true
+    git config --global --add "$helper_key" ''
+    git config --global --add "$helper_key" '!gh auth git-credential'
+    ;;
+
+  auth:token)
+    log_family 'auth token'
+    read_file "$state_dir/token_canary"
+    ;;
+
+  auth:login)
+    login=$(read_file "$state_dir/login_account")
+    log_family 'auth login' "$login"
+    if [ -e "$state_dir/login_require_pty_stdin" ]; then
+      [ -t 0 ] && [ -t 1 ] || exit 96
+      printf 'native-auth-input-ready\n'
+      IFS= read -r login_input || exit 97
+      [ "$login_input" = PTY_LOGIN_CANARY_7a2d ] || exit 98
+      printf 'pty-round-trip:%s\n' "$login_input"
+      : >"$state_dir/login_pty_stdin_ok"
+    fi
+    login_exit=$(read_file "$state_dir/login_exit")
+    [ -z "$login_exit" ] || [ "$login_exit" -eq 0 ] || exit "$login_exit"
+    if [ -n "$login" ]; then
+      grep -Fx "$login" "$state_dir/accounts" >/dev/null 2>&1 || \
+        printf '%s\n' "$login" >>"$state_dir/accounts"
+      printf '%s\n' "$login" >"$state_dir/active"
+      printf 'success\n' >"$state_dir/account.$login.state"
+      printf 'keyring\n' >"$state_dir/account.$login.source"
+    fi
+    ;;
+
+  auth:logout)
+    log_family 'auth logout'
+    ;;
+
+  api:user)
+    log_family 'api user'
+    if [ -e "$state_dir/block_api_user" ]; then
+      block_resistant_probe api-user
+    fi
+    api_exit=$(read_file "$state_dir/api_exit")
+    if [ -n "$api_exit" ] && [ "$api_exit" -ne 0 ]; then
+      read_file "$state_dir/api_error" >&2
+      exit "$api_exit"
+    fi
+    login=$(read_file "$state_dir/api_login_override")
+    [ -n "$login" ] || login=$(read_file "$state_dir/active")
+    account_id=$(read_file "$state_dir/account.$login.id")
+    account_id=${account_id:-1001}
+    if [ -e "$state_dir/account.$login.name_null" ]; then
+      # Model a GitHub profile whose display name is null (the API omits or
+      # nulls "name" for accounts that never set one). Exercises the router's
+      # login fallback for the commit author name.
+      printf '{"id":%s,"login":"%s","name":null}\n' "$account_id" "$login"
+    else
+      account_name=$(read_file "$state_dir/account.$login.name")
+      account_name=${account_name:-$login}
+      printf '{"id":%s,"login":"%s","name":"%s"}\n' "$account_id" "$login" "$account_name"
+    fi
+    ;;
+
+  repo:view)
+    log_family 'repo view'
+    if [ -e "$state_dir/block_repo_view" ]; then
+      block_resistant_probe repo-view
+    fi
+    repo_exit=$(read_file "$state_dir/repo_exit")
+    if [ -n "$repo_exit" ] && [ "$repo_exit" -ne 0 ]; then
+      read_file "$state_dir/repo_error" >&2
+      exit "$repo_exit"
+    fi
+    if [ -e "$state_dir/corrupt_lock_before_release" ]; then
+      printf 'corrupted-owner\n' >"$XDG_RUNTIME_DIR/operation.lock/owner.nonce"
+    fi
+    printf '{"nameWithOwner":"example-org/example"}\n'
+    ;;
+
+  pr:view)
+    log_family 'pr view'
+    printf '%s\n' "$(read_file "$state_dir/downstream_output")"
+    downstream_exit=$(read_file "$state_dir/downstream_exit")
+    exit "${downstream_exit:-0}"
+    ;;
+
+  pr:env-check)
+    log_family 'pr env-check'
+    [ "${GH_BROWSER:-}" = /usr/bin/false ] && \
+      [ "${GH_EDITOR:-}" = /usr/bin/false ] && \
+      [ "${GH_PAGER:-}" = /usr/bin/false ] && \
+      [ "${GIT_ASKPASS:-}" = /usr/bin/false ] && \
+      [ "${GIT_TERMINAL_PROMPT:-}" = 0 ] && \
+      [ "${GH_REPO:-}" = github.com/example-org/example ] || exit 55
+    ;;
+
+  pr:test-block)
+    log_family 'test-block'
+    if [ -e "$state_dir/child.spawn_resistant_descendant" ]; then
+      /bin/sh -c '
+        state_dir=$1
+        trap "" HUP INT TERM
+        printf "%s\n" "$$" >"$state_dir/child.descendant.pid"
+        : >"$state_dir/child.descendant.ready"
+        while :; do sleep 1; done
+      ' gh-descendant "$state_dir" &
+    fi
+    printf '%s\n' "$$" >"$state_dir/child.pid"
+    : >"$state_dir/child.ready"
+    trap '
+      if [ -e "$state_dir/child.signal_ignore" ]; then
+        : >"$state_dir/child.signal_received"
+      elif [ -e "$state_dir/child.signal_delay" ]; then
+        : >"$state_dir/child.signal_received"
+        sleep 1
+        exit 143
+      else
+        exit 143
+      fi
+    ' HUP INT TERM
+    while :; do
+      sleep 1
+    done
+    ;;
+
+  pr:test-descendant-exit)
+    log_family 'test-descendant-exit'
+    /bin/sh -c '
+      state_dir=$1
+      trap "" HUP INT TERM
+      printf "%s\n" "$$" >"$state_dir/child.descendant.pid"
+      : >"$state_dir/child.descendant.ready"
+      while :; do sleep 1; done
+    ' gh-descendant "$state_dir" &
+    descendant_attempt=0
+    while [ ! -e "$state_dir/child.descendant.ready" ]; do
+      descendant_attempt=$((descendant_attempt + 1))
+      [ "$descendant_attempt" -lt 100 ] || exit 92
+      sleep 0.01
+    done
+    : >"$state_dir/fail_group_enumeration"
+    ;;
+
+  pr:test-fork-after-snapshot)
+    log_family 'test-fork-after-snapshot'
+    /bin/sh -c '
+      state_dir=$1
+      trap "" HUP INT TERM
+      printf "%s\n" "$$" >"$state_dir/fork.coordinator.pid"
+      : >"$state_dir/fork.coordinator.ready"
+      while [ ! -e "$state_dir/fork.release" ]; do sleep 0.01; done
+      /bin/sh -c '\''
+        state_dir=$1
+        trap "" HUP INT TERM
+        printf "%s\n" "$$" >"$state_dir/fork.descendant.pid"
+        : >"$state_dir/fork.descendant.ready"
+        while :; do sleep 1; done
+      '\'' gh-fork-descendant "$state_dir" &
+    ' gh-fork-coordinator "$state_dir" &
+    coordinator_wait=0
+    while [ ! -e "$state_dir/fork.coordinator.ready" ]; do
+      coordinator_wait=$((coordinator_wait + 1))
+      [ "$coordinator_wait" -lt 100 ] || exit 92
+      sleep 0.01
+    done
+    ;;
+
+  token-alias:*)
+    log_family 'token-alias'
+    read_file "$state_dir/token_canary"
+    ;;
+
+  *)
+    log_family "${command_name:-empty} ${subcommand:-empty}"
+    downstream_exit=$(read_file "$state_dir/downstream_exit")
+    exit "${downstream_exit:-0}"
+    ;;
+esac

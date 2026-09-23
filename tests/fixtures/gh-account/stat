@@ -1,0 +1,25 @@
+#!/bin/sh
+
+# Delegating stat fixture for one-digit octal-mode parsing regressions.
+set -u
+
+real_stat=${FAKE_STAT_REAL:?FAKE_STAT_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+
+last_argument=
+for stat_argument in "$@"; do
+  last_argument=$stat_argument
+done
+
+override_target=$(sed -n '1p' "$state_dir/stat_mode_target" 2>/dev/null || true)
+override_mode=$(sed -n '1p' "$state_dir/stat_mode_value" 2>/dev/null || true)
+if [ -n "$override_target" ] && [ "$last_argument" = "$override_target" ]; then
+  case "$*" in
+    *%Lp*|*%a*)
+      printf '%s\n' "$override_mode"
+      exit 0
+      ;;
+  esac
+fi
+
+exec "$real_stat" "$@"

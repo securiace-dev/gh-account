@@ -1,0 +1,36 @@
+#!/bin/sh
+
+# Delegating ln fixture for ambiguous-success hard-link regressions.
+set -u
+
+real_ln=${FAKE_LN_REAL:?FAKE_LN_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+
+source_path=${1:-}
+target_path=${2:-}
+
+if [ -e "$state_dir/fail_guard_link_before_mutation" ]; then
+  case "$source_path:$target_path" in
+    */.gh-account-owner.*:*.lock)
+      rm -f "$state_dir/fail_guard_link_before_mutation"
+      : >"$state_dir/guard_link_pre_mutation_failed"
+      exit 91
+      ;;
+  esac
+fi
+
+"$real_ln" "$@"
+link_status=$?
+[ "$link_status" -eq 0 ] || exit "$link_status"
+
+if [ -e "$state_dir/ambiguous_guard_link" ]; then
+  case "$source_path:$target_path" in
+    */.gh-account-owner.*:*.lock)
+      rm -f "$state_dir/ambiguous_guard_link"
+      : >"$state_dir/guard_link_mutated"
+      : >"$state_dir/fail_group_enumeration_once"
+      ;;
+  esac
+fi
+
+exit 0

@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Force the production router down its macOS command-only lockf compatibility
+# path while delegating actual lock operations to the host lockf binary.
+set -u
+
+real_lockf=${FAKE_LOCKF_REAL:?FAKE_LOCKF_REAL is required}
+
+if [ "$#" -eq 4 ] && [ "$1" = -s ] && [ "$2" = -t ] && \
+   [ "$3" = 0 ] && [ "$4" = 9 ]; then
+  exit 64
+fi
+
+exec "$real_lockf" "$@"

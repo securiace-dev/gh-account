@@ -1,0 +1,53 @@
+#!/bin/sh
+
+# Delegating rm fixture for ambiguous-success unlink and stale-ready regressions.
+set -u
+
+real_rm=${FAKE_RM_REAL:?FAKE_RM_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+
+preserve_ready=false
+journal_target=false
+journal_path=
+for target_path in "$@"; do
+  case "$target_path" in
+    */operation.lock/.child.ready.*)
+      if [ -e "$state_dir/preserve_first_child_ready" ] && \
+         [ ! -e "$state_dir/child_ready_preserved" ]; then
+        preserve_ready=true
+      fi
+      ;;
+    */config.pending.json) journal_target=true; journal_path=$target_path ;;
+  esac
+done
+
+if [ "$journal_target" = true ] && \
+   [ -e "$state_dir/fail_journal_remove_before_mutation" ]; then
+  "$real_rm" -f "$state_dir/fail_journal_remove_before_mutation"
+  : >"$state_dir/journal_remove_pre_mutation_failed"
+  exit 93
+fi
+
+if [ "$preserve_ready" = true ]; then
+  : >"$state_dir/child_ready_preserved"
+  exit 95
+fi
+
+"$real_rm" "$@"
+remove_status=$?
+[ "$remove_status" -eq 0 ] || exit "$remove_status"
+
+if [ "$journal_target" = true ] && [ -e "$state_dir/ambiguous_journal_remove" ]; then
+  "$real_rm" -f "$state_dir/ambiguous_journal_remove"
+  : >"$state_dir/journal_remove_mutated"
+  : >"$state_dir/fail_group_enumeration_once"
+fi
+if [ "$journal_target" = true ] && \
+   [ -e "$state_dir/ambiguous_journal_remove_dangling_link" ]; then
+  "$real_rm" -f "$state_dir/ambiguous_journal_remove_dangling_link"
+  "$FAKE_LN_REAL" -s "$state_dir/missing-journal-target" "$journal_path"
+  : >"$state_dir/journal_remove_left_dangling_link"
+  : >"$state_dir/fail_group_enumeration_once"
+fi
+
+exit 0

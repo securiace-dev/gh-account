@@ -1,0 +1,112 @@
+#!/bin/sh
+
+# Delegating mv fixture used to inject a signal immediately after a live Git
+# config rename. Normal invocations are byte-for-byte delegated to host mv.
+set -u
+
+real_mv=${FAKE_MV_REAL:?FAKE_MV_REAL is required}
+state_dir=${FAKE_GH_STATE_DIR:?FAKE_GH_STATE_DIR is required}
+
+source_path=${1:-}
+target_path=${2:-}
+
+if [ -e "$state_dir/fail_binding_commit_journal" ]; then
+  case "$target_path" in
+    */config.pending.json)
+      if grep -F '"mode": "binding_committed"' "$source_path" >/dev/null 2>&1; then
+        : >"$state_dir/binding_commit_journal_failed"
+        exit 94
+      fi
+      ;;
+  esac
+fi
+
+case "$target_path" in
+  */.git/config)
+    binding_move_count=$(sed -n '1p' "$state_dir/binding_move_count" 2>/dev/null || true)
+    case "$binding_move_count" in ''|*[!0-9]*) binding_move_count=0 ;; esac
+    binding_move_count=$((binding_move_count + 1))
+    printf '%s\n' "$binding_move_count" >"$state_dir/binding_move_count"
+    if [ "$binding_move_count" -eq 1 ] && [ -e "$state_dir/fail_binding_install" ]; then
+      : >"$state_dir/binding_install_failed"
+      exit 92
+    fi
+    if [ "$binding_move_count" -gt 1 ] && \
+       [ -e "$state_dir/require_lock_for_binding_rollback" ] && \
+       [ ! -d "$XDG_RUNTIME_DIR/operation.lock" ]; then
+      : >"$state_dir/binding_rollback_ran_unlocked"
+      exit 93
+    fi
+    if [ "$binding_move_count" -gt 1 ] && [ -e "$state_dir/fail_binding_rollback" ]; then
+      : >"$state_dir/binding_rollback_failed"
+      exit 90
+    fi
+    ;;
+esac
+
+if [ -e "$state_dir/block_before_binding_install" ]; then
+  case "$source_path:$target_path" in
+    */.git/.gh-account-stage.*:*/.git/config)
+      printf '%s\n' "$$" >"$state_dir/binding_move.pid"
+      : >"$state_dir/binding_move.ready"
+      move_wait=0
+      while [ ! -e "$state_dir/release_binding_move" ]; do
+        move_wait=$((move_wait + 1))
+        [ "$move_wait" -lt 3000 ] || exit 95
+        sleep 0.01
+      done
+      ;;
+  esac
+fi
+
+"$real_mv" "$@"
+move_status=$?
+[ "$move_status" -eq 0 ] || exit "$move_status"
+
+case "$target_path" in
+  */operation.lock/config.guards)
+    if [ -e "$state_dir/ambiguous_manifest_move" ]; then
+      rm -f "$state_dir/ambiguous_manifest_move"
+      : >"$state_dir/manifest_move_mutated"
+      : >"$state_dir/fail_group_enumeration_once"
+    elif [ -e "$state_dir/corrupt_manifest_move" ]; then
+      rm -f "$state_dir/corrupt_manifest_move"
+      printf '/unexpected.lock\t/unexpected.owner\n' >>"$target_path"
+      : >"$state_dir/manifest_move_corrupted"
+      : >"$state_dir/fail_group_enumeration_once"
+    fi
+    ;;
+  */config.pending.json)
+    if [ -e "$state_dir/ambiguous_binding_committed_journal_move" ] && \
+       grep -F '"mode": "binding_committed"' "$target_path" >/dev/null 2>&1; then
+      rm -f "$state_dir/ambiguous_binding_committed_journal_move"
+      : >"$state_dir/journal_move_mutated"
+      : >"$state_dir/fail_group_enumeration_once"
+    elif [ -e "$state_dir/ambiguous_repair_journal_move" ] && \
+         grep -F '"mode": "repair"' "$target_path" >/dev/null 2>&1; then
+      rm -f "$state_dir/ambiguous_repair_journal_move"
+      : >"$state_dir/journal_move_mutated"
+      : >"$state_dir/fail_group_enumeration_once"
+    elif [ -e "$state_dir/corrupt_binding_committed_journal_move" ] && \
+         grep -F '"mode": "binding_committed"' "$target_path" >/dev/null 2>&1; then
+      rm -f "$state_dir/corrupt_binding_committed_journal_move"
+      jq '.binding.root += ".wrong-but-schema-valid"' "$target_path" \
+        >"$target_path.corrupt"
+      "$real_mv" "$target_path.corrupt" "$target_path"
+      : >"$state_dir/journal_move_corrupted"
+      : >"$state_dir/fail_group_enumeration_once"
+    fi
+    ;;
+esac
+
+if [ -e "$state_dir/signal_after_binding_install" ]; then
+  case "$source_path:$target_path" in
+    */.git/.gh-account-stage.*:*/.git/config)
+      : >"$state_dir/binding_install_ready"
+      kill -TERM "$PPID" 2>/dev/null || true
+      sleep 1
+      ;;
+  esac
+fi
+
+exit 0

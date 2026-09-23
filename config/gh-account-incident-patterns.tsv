@@ -1,0 +1,7 @@
+# incident_id	finding_id	severity	fixed_string_pattern
+SANDBOX_KEYCHAIN_CONTEXT	AUTH.KEYCHAIN_CONTEXT_UNAVAILABLE	warning	sandbox cannot reliably access the macOS Keychain
+SELECTED_ACCOUNT_401_SSH_HEALTHY	AUTH.INVALID	error	still 401 (invalid keyring). Public GitHub API + SSH git still work
+CACHED_ACCOUNT_NOT_VALID	AUTH.CACHED_INVENTORY_ONLY	error	reported cached account records while the host GitHub CLI
+IDENTITY_DRIFT	ACCOUNT.IDENTITY_MISMATCH	warning	commits using a macOS-derived identity
+URL_REWRITE_TRANSPORT	GIT.URL_REWRITE_TRANSPORT	warning	rewrites SCP-style SSH URLs
+RESTORATION_LOCKING_RISK	LIFECYCLE.RESTORATION_LOCKING	warning	serialize concurrent
