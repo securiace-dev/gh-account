@@ -1851,7 +1851,11 @@ test_cooperative_signal_cancels_escalation_promptly() {
   signal_finished=$(date +%s)
   assert_status 2 || return 1
   signal_elapsed=$((signal_finished - signal_started))
-  [ "$signal_elapsed" -lt 2 ] || \
+  # The invariant is "did not wait out the 3 s escalation timer". Timing is
+  # whole-second (`date +%s`), so ~1.2 s of real work can straddle two second
+  # boundaries and read as 2 on a slow hosted macOS runner, while a run that
+  # waited out the timer always reads >= 3. Assert strictly below the grace.
+  [ "$signal_elapsed" -lt 3 ] || \
     diagnose "cooperative signal waited ${signal_elapsed}s for the escalation timer" || return 1
   [ "$(cat "$fake_state/active")" = alice ] || \
     diagnose 'cooperative signal path did not restore alice' || return 1
