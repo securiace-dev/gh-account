@@ -16,6 +16,24 @@ umask 077
 program=gh-account
 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
+# run_tracked supervises routed commands through job-control process groups
+# (`set -m`) that must work without a controlling terminal. bash provides
+# that; dash — /bin/sh on Debian and Ubuntu — does not, and every routed
+# command then fails with AUTH.SWITCH_FAILED. macOS's /bin/sh is bash, so
+# bash is the only runtime this tool has been validated under. Re-exec under
+# bash when the pinned PATH above provides one (never the caller's PATH);
+# GH_ACCOUNT_SH=posix opts out for diagnosis and is unsupported.
+if [ -z "${BASH_VERSION-}" ] && [ "${GH_ACCOUNT_SH-}" != posix ] && \
+   [ -z "${GH_ACCOUNT_REEXEC-}" ] && command -v bash >/dev/null 2>&1; then
+  GH_ACCOUNT_REEXEC=1 exec bash "$0" "$@"
+fi
+# The routed-command supervisor is a separate `-c` script. It must run under
+# the same shell as the router: it needs `set -m` to succeed without a tty and
+# `kill -SIG -- -pgid` to address its own group, and dash provides neither
+# (its `set -m` fails with "can't access tty; job control turned off" and its
+# builtin kill rejects `-- -pgid` with "Illegal number"). $BASH is bash's own
+# path when running under bash — including macOS /bin/sh — and unset otherwise.
+supervisor_shell=${BASH:-/bin/sh}
 original_xdg_config_home=${XDG_CONFIG_HOME-}
 original_gh_config_dir=${GH_CONFIG_DIR-}
 trusted_xdg_config_home=$HOME/.config
@@ -120,19 +138,20 @@ usage() {
   cat <<'EOF'
 Usage:
   gh-account list
-  gh-account current [REPO]
-  gh-account doctor [REPO] [--account USER] [--deep] [--json]
-  gh-account preflight USER [REPO] [--required-scopes LIST] [--json]
-  gh-account repair USER [REPO] [--dry-run] [--interactive]
+  gh-account current [REPO_PATH]
+  gh-account doctor [REPO_PATH] [--account USER] [--deep] [--json]
+  gh-account preflight USER [REPO_PATH] [--required-scopes LIST] [--json]
+  gh-account repair USER [REPO_PATH] [--dry-run] [--interactive]
   gh-account reauth USER [--scopes LIST] [--json]
-  gh-account onboard USER [REPO] [--scopes LIST]
+  gh-account onboard USER [REPO_PATH] [--scopes LIST]
   gh-account insights [ANALYZER_OPTIONS]
-  gh-account bind USER [REPO]
-  gh-account use USER [REPO]
-  gh-account auto [REPO]
+  gh-account bind USER [REPO_PATH]
+  gh-account use USER [REPO_PATH]
+  gh-account auto [REPO_PATH]
   gh-account exec USER [--] GH_ARGUMENTS...
-  gh-account git-exec USER REPO -- {fetch|push|ls-remote} origin [GIT_ARGUMENTS...]
+  gh-account git-exec USER REPO_PATH -- {fetch|push|ls-remote} origin [GIT_ARGUMENTS...]
 
+REPO_PATH is a filesystem path to a local Git worktree (e.g. "$PWD"), never owner/repo.
 doctor is read-only and emits secret-free findings for humans or agents.
 preflight proves the routed account identity and restores the prior account.
 repair applies deterministic Git configuration fixes; --interactive may reauth.
@@ -223,10 +242,80 @@ normalize_octal_mode() {
   esac
 }
 
+path_gid() {
+  case "$stat_style" in
+    bsd) stat -f '%g' "$1" 2>/dev/null ;;
+    gnu) stat -c '%g' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+path_group_name() {
+  case "$stat_style" in
+    bsd) stat -f '%Sg' "$1" 2>/dev/null ;;
+    gnu) stat -c '%G' "$1" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# A group-write bit only widens who can write if the group contains someone
+# other than the owner. On user-private-group systems (the Debian/Ubuntu
+# default: umask 002, every user's primary group is a same-named group with no
+# other members) group-writable IS owner-only, and rejecting it makes every
+# `git init` repository unusable. Accept the bit only when all of these hold:
+# the group is named after the owner, it is the owner's primary group, and its
+# explicit member list contains nobody but the owner. Anything else — a shared
+# `staff`/`admin`/`users` group, a group with members, an unresolvable group —
+# stays rejected. Fail closed on any lookup failure. Memoised on gid because
+# the ancestor walks ask the same question dozens of times per run.
+group_is_private_to_owner() {
+  gipo_path=$1
+  gipo_gid=$(path_gid "$gipo_path") || return 1
+  gipo_uid=$(path_uid "$gipo_path") || return 1
+  case "$gipo_gid$gipo_uid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "${upg_cache_key-}" = "$gipo_gid:$gipo_uid" ]; then
+    return "$upg_cache_result"
+  fi
+  upg_cache_key=$gipo_gid:$gipo_uid
+  upg_cache_result=1
+  gipo_owner=$(id -un "$gipo_uid" 2>/dev/null) || return 1
+  gipo_primary=$(id -g "$gipo_uid" 2>/dev/null) || return 1
+  [ "$gipo_primary" = "$gipo_gid" ] || return 1
+  gipo_group=$(path_group_name "$gipo_path") || return 1
+  [ -n "$gipo_group" ] && [ "$gipo_group" = "$gipo_owner" ] || return 1
+  case "$platform_name" in
+    Darwin)
+      gipo_members=$(dscl . -read "/Groups/$gipo_group" GroupMembership 2>/dev/null | sed 's/^GroupMembership://')
+      ;;
+    *)
+      # getent consults NSS (LDAP, SSSD); /etc/group is the local fallback
+      # when getent is absent (minimal images, restricted PATHs). A gid
+      # resolvable by neither stays rejected.
+      if command_exists getent; then
+        gipo_entry=$(getent group "$gipo_gid" 2>/dev/null) || return 1
+      elif [ -r /etc/group ]; then
+        gipo_entry=$(awk -F: -v gid="$gipo_gid" '$3 == gid { print; exit }' /etc/group 2>/dev/null)
+      else
+        return 1
+      fi
+      [ -n "$gipo_entry" ] || return 1
+      gipo_members=$(printf '%s\n' "$gipo_entry" | cut -d: -f4 | tr ',' ' ')
+      ;;
+  esac
+  for gipo_member in $gipo_members; do
+    [ "$gipo_member" = "$gipo_owner" ] || return 1
+  done
+  upg_cache_result=0
+  return 0
+}
+
 path_mode_is_owner_controlled() {
   pmoc_mode=$(normalize_octal_mode "$(path_mode "$1" 2>/dev/null || true)" 2>/dev/null) || return 1
   pmoc_tail=${pmoc_mode#??}
-  case "$pmoc_tail" in [2367]?|?[2367]) return 1 ;; esac
+  case "$pmoc_tail" in ?[2367]) return 1 ;; esac
+  case "$pmoc_tail" in
+    [2367]?) group_is_private_to_owner "$1" || return 1 ;;
+  esac
   return 0
 }
 
@@ -235,6 +324,13 @@ path_mode_is_not_world_writable() {
   pminww_last=${pminww_mode#???}
   case "$pminww_last" in 2|3|6|7) return 1 ;; esac
   return 0
+}
+
+dir_mode_has_sticky_bit() {
+  dhsb_mode=$(normalize_octal_mode "$(path_mode "$1" 2>/dev/null || true)" 2>/dev/null) || return 1
+  dhsb_special=${dhsb_mode%???}
+  case "$dhsb_special" in 1|3|5|7) return 0 ;; esac
+  return 1
 }
 
 config_regular_file_is_safe() {
@@ -944,9 +1040,11 @@ audit_directory_is_safe() {
           [ "$(path_uid "$ads_dir")" = "$account_uid" ] || return 1
       fi
     fi
-    ads_mode=$(normalize_octal_mode "$(path_mode "$ads_dir" 2>/dev/null || true)" 2>/dev/null) || return 1
-    ads_tail=${ads_mode#??}
-    case "$ads_tail" in [2367]?|?[2367]) return 1 ;; esac
+    # One decision function for "can a non-owner write here" — this used to
+    # be an inline copy of the mode-bit test, which silently diverged once the
+    # private-group rule landed and left the audit spool unwritable on every
+    # user-private-group host (no events recorded, no error to the caller).
+    path_mode_is_owner_controlled "$ads_dir" || return 1
     audit_path_acl_is_safe "$ads_dir" || return 1
   done
   chmod 700 "$ads_expected" 2>/dev/null || return 1
@@ -1167,6 +1265,13 @@ lease_process_matches() {
   case "$lpm_pid" in ''|*[!0-9]*) return 1 ;; esac
   [ -n "$lpm_birth" ] || return 1
   kill -0 "$lpm_pid" 2>/dev/null || return 1
+  # A zombie still answers kill -0 and still reports its original lstart, but
+  # it has exited and can never release anything. It stays a zombie only when
+  # its parent died and PID 1 does not reap orphans — a container started
+  # without --init, exactly where agents run this tool. Treat it as gone so a
+  # crashed operation's lease can be reclaimed there too.
+  lpm_state=$(LC_ALL=C ps -o stat= -p "$lpm_pid" 2>/dev/null | tr -d '[:space:]')
+  case "$lpm_state" in Z*) return 1 ;; esac
   lpm_current=$(process_birth "$lpm_pid" 2>/dev/null || true)
   [ -z "$lpm_current" ] || [ "$lpm_current" = "$lpm_birth" ]
 }
@@ -2198,7 +2303,7 @@ run_tracked() {
     [ -z "$rt_pending_signal" ] || handle_signal "$rt_pending_signal"
     return "$EXIT_UNAVAILABLE"
   }
-  /bin/sh -c '
+  "$supervisor_shell" -c '
     ready=$1
     parent_pid=$2
     tempfail=$3
@@ -2239,13 +2344,19 @@ run_tracked() {
     trap "" HUP INT TERM
     refresh_group_members() {
       group_failure_reason=ps-snapshot
-      group_processes=$(ps -axo pid=,pgid= 2>/dev/null) || return 2
+      # stat= is included so exited-but-unreaped members (state Z) are not
+      # counted as live: a zombie still answers kill -0 and still lists its
+      # pgid, but can never run again. Without this, any host whose PID 1
+      # does not reap orphans (a container started without --init) pins the
+      # group forever after the parent dies, and the stale lease can never be
+      # reclaimed.
+      group_processes=$(ps -axo pid=,pgid=,stat= 2>/dev/null) || return 2
       group_failure_reason=ps-shape
       group_candidates=$(printf "%s\n" "$group_processes" | awk -v group="$$" \
         "
-          NF != 2 || \$1 !~ /^[0-9]+$/ || \$2 !~ /^[0-9]+$/ { malformed = 1 }
+          NF != 3 || \$1 !~ /^[0-9]+$/ || \$2 !~ /^[0-9]+$/ { malformed = 1 }
           \$1 == group && \$2 == group { self_rows++ }
-          \$2 == group && \$1 != group { print \$1 }
+          \$2 == group && \$1 != group && \$3 !~ /^Z/ { print \$1 }
           END { if (malformed || self_rows != 1) exit 2 }
         ") || return 2
       remaining=
@@ -2256,7 +2367,21 @@ run_tracked() {
           kill -0 "$candidate_pid" 2>/dev/null && return 2
           continue
         }
-        case "$candidate_group" in ""|*[!0-9]*) return 2 ;; esac
+        # procps answers `ps -p <pid>` for a process that exits between the
+        # snapshot and this query with exit 0 and NO output (found in the
+        # /proc scan, gone before its stat could be read); BSD ps does not.
+        # A member that has vanished is not a member: re-confirm with kill -0
+        # and drop it. Only a still-live process that cannot be classified is
+        # a real inspection failure worth failing closed on.
+        if [ -z "$candidate_group" ]; then
+          kill -0 "$candidate_pid" 2>/dev/null || continue
+          candidate_group=$(ps -o pgid= -p "$candidate_pid" 2>/dev/null | tr -d "[:space:]") || {
+            kill -0 "$candidate_pid" 2>/dev/null && return 2
+            continue
+          }
+          [ -n "$candidate_group" ] || { kill -0 "$candidate_pid" 2>/dev/null && return 2; continue; }
+        fi
+        case "$candidate_group" in *[!0-9]*) return 2 ;; esac
         [ "$candidate_group" = "$$" ] || continue
         if [ -n "$remaining" ]; then
           remaining="$remaining $candidate_pid"
@@ -2777,6 +2902,7 @@ git_program_config_is_trusted() {
 
 config_origin_file_is_safe() {
   cofis_path=$1
+  cofis_scope=${2:-}
   case "$cofis_path" in /*) ;; *) return 1 ;; esac
   printf '%s' "$cofis_path" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
   cofis_parent=${cofis_path%/*}
@@ -2785,6 +2911,12 @@ config_origin_file_is_safe() {
   cofis_path=$cofis_parent/$cofis_base
   cofis_program_config=false
   git_program_config_is_trusted "$cofis_path" && cofis_program_config=true
+  # System-scope config is administrator-managed: its file must still be
+  # root/owner-owned and not group- or world-writable, but its ancestry may
+  # be admin-group-writable (Homebrew's /opt/homebrew, /usr/local) exactly as
+  # Apple Git's bundled config already may. Only the reported scope grants
+  # this; a user-controlled include that merely lives under /opt does not.
+  [ "$cofis_scope" = system ] && cofis_program_config=true
   [ -f "$cofis_path" ] && [ ! -L "$cofis_path" ] || return 1
   cofis_uid=$(path_uid "$cofis_path" 2>/dev/null || true)
   { [ "$cofis_uid" = "$account_uid" ] || [ "$cofis_uid" = 0 ]; } && \
@@ -2797,7 +2929,17 @@ config_origin_file_is_safe() {
     [ -d "$cofis_current" ] && [ ! -L "$cofis_current" ] || return 1
     cofis_uid=$(path_uid "$cofis_current" 2>/dev/null || true)
     if [ "$cofis_uid" = "$account_uid" ]; then
-      path_mode_is_owner_controlled "$cofis_current" || return 1
+      if path_mode_is_owner_controlled "$cofis_current"; then
+        :
+      elif [ "$cofis_program_config" = true ]; then
+        # Same admin-managed tolerance as the root-owned branch below: a
+        # packaged git's prefix may be owned by the installing user with an
+        # admin group write bit (Homebrew's /opt/homebrew is runner:admin 775
+        # on hosted CI). Still never world-writable.
+        path_mode_is_not_world_writable "$cofis_current" || return 1
+      else
+        return 1
+      fi
     elif [ "$cofis_uid" = 0 ]; then
       if path_mode_is_owner_controlled "$cofis_current"; then
         :
@@ -2807,6 +2949,15 @@ config_origin_file_is_safe() {
         # writable. Only that exact git --exec-path-derived config gets this
         # narrow exception; arbitrary root-owned include ancestry does not.
         path_mode_is_not_world_writable "$cofis_current" || return 1
+      elif dir_mode_has_sticky_bit "$cofis_current"; then
+        # A root-owned, world-writable directory with the sticky bit set
+        # (the standard /tmp, /var/tmp convention on every POSIX system) is
+        # safe: the sticky bit stops any principal other than a file's own
+        # owner, the directory's owner, or root from renaming or removing
+        # that file, which is exactly the tampering this ancestor walk
+        # defends against. A world-writable directory WITHOUT the sticky
+        # bit gets no such exception.
+        :
       else
         return 1
       fi
@@ -2838,7 +2989,14 @@ config_origin_path_is_safe_or_absent() {
     [ -d "$copisoa_current" ] && [ ! -L "$copisoa_current" ] || return 1
     copisoa_uid=$(path_uid "$copisoa_current" 2>/dev/null || true)
     { [ "$copisoa_uid" = "$account_uid" ] || [ "$copisoa_uid" = 0 ]; } || return 1
-    path_mode_is_owner_controlled "$copisoa_current" || return 1
+    if [ "$copisoa_uid" = 0 ]; then
+      # See config_origin_file_is_safe: a root-owned, world-writable
+      # directory is safe when the sticky bit is set (/tmp, /var/tmp).
+      path_mode_is_owner_controlled "$copisoa_current" || \
+        dir_mode_has_sticky_bit "$copisoa_current" || return 1
+    else
+      path_mode_is_owner_controlled "$copisoa_current" || return 1
+    fi
     audit_path_acl_is_safe "$copisoa_current" || return 1
     [ "$copisoa_current" = / ] && break
     copisoa_current=${copisoa_current%/*}
@@ -2885,8 +3043,13 @@ git_config_origins_are_safe() {
   [ -z "$gco_path_list" ] || : >"$gco_path_list" || return 1
   make_temp || return 1
   gco_origins=$new_temp_path
+  # --show-scope prefixes each line with system|global|local|worktree|command.
+  # System-scope origins are administrator-managed by definition, so their
+  # ancestry gets the same "not world-writable" tolerance Apple Git's bundled
+  # config already had — a packaged git's prefix (Homebrew's group-writable
+  # /opt/homebrew, a distro's /etc) must not make every repository unusable.
   if [ -n "$gco_repo" ]; then
-    git -C "$gco_repo" config --includes --show-origin --name-only --list \
+    git -C "$gco_repo" config --includes --show-scope --show-origin --name-only --list \
       >"$gco_origins" 2>/dev/null || return 1
   else
     if [ ! -e "$HOME/.gitconfig" ] && [ ! -L "$HOME/.gitconfig" ] && \
@@ -2894,13 +3057,17 @@ git_config_origins_are_safe() {
        [ ! -L "$trusted_xdg_config_home/git/config" ]; then
       return 0
     fi
-    git config --global --includes --show-origin --name-only --list \
+    git config --global --includes --show-scope --show-origin --name-only --list \
       >"$gco_origins" 2>/dev/null || return 1
   fi
   gco_tab=$(printf '\t')
   gco_previous_origin=
-  while IFS="$gco_tab" read -r gco_origin gco_key gco_extra; do
-    [ -n "$gco_origin" ] && [ -n "$gco_key" ] && [ -z "$gco_extra" ] || return 1
+  while IFS="$gco_tab" read -r gco_scope gco_origin gco_key gco_extra; do
+    [ -n "$gco_scope" ] && [ -n "$gco_origin" ] && [ -n "$gco_key" ] && [ -z "$gco_extra" ] || return 1
+    # Apple Git labels its bundled toolchain config `unknown` rather than
+    # `system`; it is admitted as a scope value but gets no scope-based
+    # tolerance (git_program_config_is_trusted already covers that file).
+    case "$gco_scope" in system|global|local|worktree|command|unknown) ;; *) return 1 ;; esac
     if [ "$gco_origin" = "$gco_previous_origin" ]; then
       continue
     fi
@@ -2934,7 +3101,7 @@ git_config_origins_are_safe() {
         ;;
       *) return 1 ;;
     esac
-    config_origin_file_is_safe "$gco_path" || return 1
+    config_origin_file_is_safe "$gco_path" "$gco_scope" || return 1
     if [ -n "$gco_path_list" ]; then
       printf '%s\n' "$gco_path" >>"$gco_path_list" || return 1
       append_declared_config_includes "$gco_path" "$gco_path_list" || return 1
@@ -5355,7 +5522,7 @@ git_exec_command() {
   assert_safe_git_context
   git_exec_is_safe "$@" || die_code "$EXIT_NOPERM" "SAFETY.REFUSED: git-exec permits only a reviewed origin fetch, push, or ls-remote"
   gec_repo=$(repository_root "$gec_repo_arg" 2>/dev/null || true)
-  [ -n "$gec_repo" ] || die_code "$EXIT_CONFIG" "git-exec repository is not a Git worktree"
+  [ -n "$gec_repo" ] || die_code "$EXIT_CONFIG" "not a Git repository: $gec_repo_arg (git-exec REPO_PATH is a path to a local worktree, not owner/repo)"
   make_temp || die_code "$EXIT_TEMPFAIL" "repository Git configuration could not be inspected safely"
   gec_config_origins=$new_temp_path
   git_config_posture_is_safe "$gec_repo" "$gec_config_origins" || \

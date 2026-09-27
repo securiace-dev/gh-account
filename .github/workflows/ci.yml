@@ -19,3 +19,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y jq shellcheck
       - run: bash tests/run.sh
+
+  # Debian/Ubuntu accounts default to user-private groups with umask 002, so
+  # every git-created file is group-writable. The router must treat that as
+  # owner-only (see docs/portability-rca-2026-09-27.md #2); this leg keeps it so.
+  test-linux-umask-002:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - run: umask 002 && bash tests/run.sh

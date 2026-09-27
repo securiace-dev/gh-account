@@ -173,7 +173,11 @@ setup_case() {
 
   # Supply only explicit tools. This lets dependency tests prove that the
   # production CLI handles an actually absent gh, jq, or git executable.
-  for case_tool in awk basename cat chmod cmp cp cut date dirname env grep head id \
+  # bash is listed because the router re-execs under it from its pinned PATH:
+  # without it, Linux hosts whose /bin/sh is dash run the job-control
+  # supervisor under a shell it was never validated on and every routed
+  # command fails — exactly the runtime this suite must exercise.
+  for case_tool in awk basename bash cat chmod cmp cp cut date dirname env grep head id \
     mkdir mktemp printf ps rmdir sed sleep sort tail touch tr uname wc; do
     link_host_tool "$case_tool"
   done
@@ -287,15 +291,23 @@ wait_for_file() {
   [ -e "$waited_file" ]
 }
 
+process_is_live() {
+  # kill -0 alone is zombie-blind: a KILLed child whose parent is gone stays
+  # signalable when PID 1 does not reap orphans (containers without --init).
+  # The router uses the same state check in lease_process_matches.
+  kill -0 "$1" 2>/dev/null || return 1
+  [ "$(LC_ALL=C ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != Z ]
+}
+
 wait_for_process_exit() {
   waited_pid=$1
   waited_attempts=${2:-500}
   waited_count=0
-  while kill -0 "$waited_pid" 2>/dev/null && [ "$waited_count" -lt "$waited_attempts" ]; do
+  while process_is_live "$waited_pid" && [ "$waited_count" -lt "$waited_attempts" ]; do
     sleep 0.01
     waited_count=$((waited_count + 1))
   done
-  ! kill -0 "$waited_pid" 2>/dev/null
+  ! process_is_live "$waited_pid"
 }
 
 terminate_case_router() {
@@ -633,7 +645,25 @@ test_git_config_includes_require_safe_origins() {
   bind_repo_to_bob
   included_parent=$case_root/included-parent
   mkdir "$included_parent"
-  chmod 770 "$included_parent"
+  # The invariant is "a parent writable by a principal other than the owner is
+  # refused". Plain `chmod 770` no longer expresses that on user-private-group
+  # systems (Debian/Ubuntu: the owner's primary group is a same-named group
+  # with no other members, so 770 is owner-only and the router now accepts it).
+  # Hand the directory to a group the owner belongs to but which is NOT their
+  # private group when one exists; otherwise fall back to other-writable.
+  shared_gid=
+  for candidate_gid in $(id -G); do
+    [ "$candidate_gid" != "$(id -g)" ] || continue
+    if chgrp "$candidate_gid" "$included_parent" 2>/dev/null; then
+      shared_gid=$candidate_gid
+      break
+    fi
+  done
+  if [ -n "$shared_gid" ]; then
+    chmod 770 "$included_parent"
+  else
+    chmod 707 "$included_parent"
+  fi
   included_config=$included_parent/included.gitconfig
   "$host_git" config --file "$included_config" safe.fixture true
   chmod 600 "$included_config"
@@ -1517,15 +1547,36 @@ test_git_exec_recovers_owned_config_guards_after_crash() {
   }
   : >"$fake_state/release_git_transport"
   child_wait=0
-  while kill -0 "$child_pid" 2>/dev/null && [ "$child_wait" -lt 1000 ]; do
+  while process_is_live "$child_pid" && [ "$child_wait" -lt 1000 ]; do
     sleep 0.01
     child_wait=$((child_wait + 1))
   done
-  if kill -0 "$child_pid" 2>/dev/null; then
+  if process_is_live "$child_pid"; then
     kill -KILL "$child_pid" 2>/dev/null || true
     diagnose 'orphaned routed Git child did not exit after release'
     return 1
   fi
+  # The crashed router's lease also names its supervisor (child.owner). The
+  # supervisor only exits after two empty process-group snapshots 100 ms apart,
+  # and while it is alive the lease is legitimately busy (LOCK.BUSY, retryable).
+  # macOS starts the next router slowly enough to lose that race by accident;
+  # Linux wins it. Wait for the supervisor explicitly so the assertion below
+  # tests reclaim, not scheduler timing.
+  supervisor_pid=$(sed -n '1p' "$gh_account_lock_dir/child.owner" 2>/dev/null || true)
+  case "$supervisor_pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      supervisor_wait=0
+      # kill -0 alone cannot see that the supervisor has exited when its
+      # parent (the crashed router) is gone and PID 1 does not reap orphans
+      # (containers without --init): the zombie stays signalable. Consult
+      # the process state as the router itself now does.
+      while process_is_live "$supervisor_pid" && [ "$supervisor_wait" -lt 1000 ]; do
+        sleep 0.01
+        supervisor_wait=$((supervisor_wait + 1))
+      done
+      ;;
+  esac
   # Recovery is deliberately restricted to the quarantined prior identity.
   run_cli preflight alice --json
   assert_status 0 || { sed 's/^/guard recovery stderr: /' "$cli_stderr" >&2; return 1; }
@@ -1770,7 +1821,7 @@ test_exec_signal_restores_identity_and_releases_lock() {
   wait "$router_pid"
   cli_status=$?
   assert_status 2 || return 1
-  if kill -0 "$child_pid" 2>/dev/null; then
+  if process_is_live "$child_pid"; then
     kill -TERM "$child_pid" 2>/dev/null || true
     diagnose 'router signal did not terminate its gh child'
     return 1
@@ -1867,7 +1918,7 @@ test_signal_escalates_for_resistant_child() {
   wait "$router_pid"
   cli_status=$?
   assert_status 2 || return 1
-  if kill -0 "$child_pid" 2>/dev/null; then
+  if process_is_live "$child_pid"; then
     kill -KILL "$child_pid" 2>/dev/null || true
     diagnose 'signal watchdog did not terminate the resistant child'
     return 1
@@ -1894,7 +1945,7 @@ test_signal_terminates_resistant_descendants_before_restore() {
   wait "$router_pid"
   cli_status=$?
   assert_status 2 || return 1
-  if kill -0 "$descendant_pid" 2>/dev/null; then
+  if process_is_live "$descendant_pid"; then
     kill -KILL "$descendant_pid" 2>/dev/null || true
     diagnose 'router restored the account while a resistant descendant remained alive'
     return 1
@@ -1915,11 +1966,11 @@ test_group_enumeration_failure_terminates_descendants() {
     diagnose 'process-group enumeration failure was not injected' || return 1
   descendant_pid=$(cat "$fake_state/child.descendant.pid")
   descendant_wait=0
-  while kill -0 "$descendant_pid" 2>/dev/null && [ "$descendant_wait" -lt 100 ]; do
+  while process_is_live "$descendant_pid" && [ "$descendant_wait" -lt 100 ]; do
     sleep 0.01
     descendant_wait=$((descendant_wait + 1))
   done
-  if kill -0 "$descendant_pid" 2>/dev/null; then
+  if process_is_live "$descendant_pid"; then
     kill -KILL "$descendant_pid" 2>/dev/null || true
     diagnose 'enumeration failure released routing with a descendant alive'
     return 1
@@ -2667,7 +2718,7 @@ test_lock_held_native_probes_are_lifecycle_tracked() {
     wait "$router_pid"
     cli_status=$?
     assert_status 2 || return 1
-    if kill -0 "$probe_pid" 2>/dev/null; then
+    if process_is_live "$probe_pid"; then
       kill -KILL "$probe_pid" 2>/dev/null || true
       diagnose "$probe_family survived account restoration and lock release"
       return 1
@@ -2691,7 +2742,7 @@ test_group_cleanup_rescans_after_an_empty_snapshot() {
   wait_for_file "$fake_state/fork.descendant.ready" 200 || \
     diagnose 'fork-after-snapshot descendant was not created' || return 1
   fork_descendant_pid=$(sed -n '1p' "$fake_state/fork.descendant.pid")
-  if kill -0 "$fork_descendant_pid" 2>/dev/null; then
+  if process_is_live "$fork_descendant_pid"; then
     kill -KILL "$fork_descendant_pid" 2>/dev/null || true
     diagnose 'supervisor accepted an empty snapshot without a stability rescan'
     return 1

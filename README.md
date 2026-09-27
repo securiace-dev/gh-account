@@ -66,8 +66,32 @@ gh extension install securiace-dev/gh-account
 # then: gh account <subcommand> ...
 ```
 
-**Requirements:** POSIX `/bin/sh`, the GitHub CLI (`gh`), Git, and `jq`.
-Tested on macOS and Linux.
+**Requirements:** the GitHub CLI (`gh`), Git, `jq`, and **bash** (preferred; see below).
+Tested on macOS and Linux (Debian/Ubuntu, including user-private-group accounts).
+
+### Runtime and portability notes
+
+- **bash is the validated runtime.** The script is `#!/bin/sh` for installability, but it
+  re-executes itself under `bash` when its pinned `PATH` provides one. Routed commands are
+  supervised through a job-control process group, which needs `set -m` to work without a
+  controlling terminal — bash does that, dash (Debian/Ubuntu's `/bin/sh`) does not. macOS's
+  `/bin/sh` is bash, so nothing changes there. `GH_ACCOUNT_SH=posix` disables the re-exec for
+  diagnosis; it is not a supported way to run routed commands.
+- **User-private groups are understood.** On systems where each user's primary group is a
+  same-named group with no other members (the Debian/Ubuntu default, `umask 002`), a group-write
+  bit is treated as owner-only. On shared primary groups (macOS `staff`, `users`, `admin`) it is
+  still refused — there it really is shared.
+- **Sticky-bit directories** (`/tmp`, `/var/tmp`) are accepted as ancestors; world-writable
+  directories without the sticky bit are not.
+- **System-scope git config** (`git config --system`) may live under a package prefix whose
+  ancestry is admin-group-writable (Homebrew's `/opt/homebrew`); that ancestry is tolerated for
+  system scope only. The file itself must still be owner- or root-owned and not writable by others.
+- **Containers without an init** (plain `docker run`) leave exited processes as zombies. The
+  router's liveness checks account for that, so a crashed operation's lease can still be
+  reclaimed there.
+
+The full reasoning, with the experiments that proved each item, is in
+[`docs/portability-rca-2026-09-27.md`](docs/portability-rca-2026-09-27.md).
 
 ## Usage
 
