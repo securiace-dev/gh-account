@@ -175,3 +175,9 @@ right.
 Full `tests/run.sh` (122 behavioural tests + insights suite + shellcheck): clean on macOS
 (`umask 022`), and in a clean `ubuntu:24.04` container as a normal user under both `umask 002`
 and `umask 022`, with an init-less PID 1 (the harsher environment). CI is the oracle for #3.
+
+**CI confirmation.** Run `36292687593` (`b39d10c`): both Linux legs green; the hosted macOS
+runner failed exactly one test of 122 — #84, a whole-second timing assertion (`< 2 s` against a
+3 s grace) that a slow runner reads as 2 — and passed every test from 21 onward, which is what
+confirms #3. The assertion was corrected to the discriminating value (`< 3 s`) in `3a571ed`;
+run `36293820124` is green on all three legs (macOS 21m45s, Linux 5m44s, Linux-umask-002 5m45s).
