@@ -1291,6 +1291,47 @@ test_exec_refuses_gh_repo_environment_override() {
   assert_file_not_contains "$fake_state/calls.log" 'pr view'
 }
 
+test_exec_accepts_positional_repository_selector_without_origin() {
+  setup_case
+  # `gh repo view|edit|delete|archive|... [<repository>]` take the repository as
+  # a positional, not via -R. Outside any repository that positional is the
+  # only routing evidence and must be honoured like --repo.
+  : >"$cli_stdout"
+  : >"$cli_stderr"
+  (cd "$case_root" && "$case_gh_account_bin" exec bob -- repo view example-org/example --json name \
+    >"$cli_stdout" 2>"$cli_stderr")
+  cli_status=$?
+  assert_status 0 || return 1
+  assert_file_contains "$fake_state/calls.log" 'repo view' || return 1
+
+  # A local repository with no origin remote must not change the answer.
+  make_repo
+  : >"$fake_state/calls.log"
+  : >"$cli_stdout"
+  : >"$cli_stderr"
+  (cd "$case_repo" && "$case_gh_account_bin" exec bob -- repo edit example-org/example --description x \
+    >"$cli_stdout" 2>"$cli_stderr")
+  cli_status=$?
+  assert_status 0 || return 1
+  assert_file_contains "$fake_state/calls.log" 'repo edit' || return 1
+
+  # A positional selector never routes off-host, and a bare name is not a selector.
+  for refused_args in \
+    'repo view enterprise.invalid/example-org/example' \
+    'repo view example'; do
+    : >"$fake_state/calls.log"
+    : >"$cli_stdout"
+    : >"$cli_stderr"
+    # shellcheck disable=SC2086 # Deliberately split the fixed test vector.
+    (cd "$case_root" && "$case_gh_account_bin" exec bob -- $refused_args \
+      >"$cli_stdout" 2>"$cli_stderr")
+    cli_status=$?
+    assert_status 77 || return 1
+    assert_combined_contains SAFETY.REFUSED || return 1
+    assert_file_not_contains "$fake_state/calls.log" 'repo view' || return 1
+  done
+}
+
 test_exec_allows_only_read_only_graphql() {
   setup_case
   # shellcheck disable=SC2016 # GraphQL variables must remain literal.
@@ -3128,6 +3169,8 @@ run_test 'generic exec pins the repository and neutralizes local launchers' \
   test_exec_pins_repo_and_neutralizes_local_program_launchers
 run_test 'generic exec rejects GH_REPO environment routing' \
   test_exec_refuses_gh_repo_environment_override
+run_test 'generic exec accepts a positional repository selector without an origin' \
+  test_exec_accepts_positional_repository_selector_without_origin
 run_test 'generic exec permits only constrained read-only GraphQL' \
   test_exec_allows_only_read_only_graphql
 run_test 'generic exec preserves child exit and restores account' \
