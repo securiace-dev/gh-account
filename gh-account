@@ -5182,6 +5182,14 @@ valid_repository_selector() {
   [ -n "$vrs_owner" ] && [ -n "$vrs_repo" ]
 }
 
+repo_subcommand_takes_positional_repository() {
+  # Subcommands whose gh usage line reads `gh repo <sub> [<repository>]`.
+  case "${1:-}" in
+    view|edit|delete|archive|unarchive|set-default|clone|fork|sync) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 gh_command_uses_repository() {
   case "$1" in
     issue|pr|release|run|workflow) return 0 ;;
@@ -5223,6 +5231,17 @@ exec_routes_to_host() {
             "$host/"*/*) valid_repository_selector "$erh_arg" || return 1; erh_explicit_repo=true ;;
             *) return 1 ;;
           esac
+        fi
+        ;;
+      */*)
+        # `gh repo view|edit|delete|... [<repository>]` take OWNER/REPO as a
+        # positional, not via -R. Outside a repository (or in one with no
+        # origin) that positional is the only routing evidence; honour it the
+        # way --repo is honoured. The host boundary is unaffected: anything
+        # with a host prefix or a URL was already handled above.
+        if [ "$erh_command" = repo ] && repo_subcommand_takes_positional_repository "${2:-}"; then
+          valid_repository_selector "$erh_arg" || return 1
+          erh_explicit_repo=true
         fi
         ;;
     esac
