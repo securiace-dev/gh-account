@@ -1291,6 +1291,114 @@ test_exec_refuses_gh_repo_environment_override() {
   assert_file_not_contains "$fake_state/calls.log" 'pr view'
 }
 
+# Run `exec bob -- ARGS...` from DIR with stdout/stderr captured.
+run_exec_in() {
+  exec_dir=$1
+  shift
+  : >"$cli_stdout"
+  : >"$cli_stderr"
+  (cd "$exec_dir" && "$case_gh_account_bin" exec bob -- "$@" \
+    >"$cli_stdout" 2>"$cli_stderr")
+  cli_status=$?
+}
+
+test_exec_ignores_a_leading_gh_word() {
+  setup_case
+  make_repo example-org
+  run_exec_in "$case_repo" gh pr env-check
+  assert_status 0 || return 1
+  assert_combined_contains 'without the leading "gh"' || return 1
+  assert_file_contains "$fake_state/calls.log" 'pr env-check' || return 1
+  [ "$(cat "$fake_state/active")" = alice ] || \
+    diagnose 'exec with a leading gh did not restore alice'
+  # Only a single leading word is dropped; `gh` alone is still a usage error.
+  run_exec_in "$case_repo" gh
+  assert_status 64 || return 1
+}
+
+test_exec_refusals_name_the_safe_form() {
+  setup_case
+  make_repo example-org
+  # Each refusal keeps its exit code and SAFETY.REFUSED line and adds a hint.
+  run_exec_in "$case_repo" pr -R example-org/example list
+  assert_status 77 || return 1
+  assert_combined_contains SAFETY.REFUSED || return 1
+  assert_combined_contains 'put flags after the subcommand' || return 1
+
+  run_exec_in "$case_repo" pr create --title x --body-file /tmp/body.md
+  assert_status 77 || return 1
+  assert_combined_contains SAFETY.REFUSED || return 1
+  assert_combined_contains '--body-file - < file' || return 1
+
+  run_exec_in "$case_repo" pr checkout 1
+  assert_status 77 || return 1
+  assert_combined_contains 'pr checkout rewrites the local worktree' || return 1
+
+  run_exec_in "$case_root" pr list
+  assert_status 77 || return 1
+  assert_combined_contains 'not a Git worktree' || return 1
+  assert_combined_contains 'add -R OWNER/REPO' || return 1
+
+  # A selector keeps working outside a worktree, and the hint never echoes arguments.
+  run_exec_in "$case_root" pr list -R example-org/example
+  assert_status 0 || return 1
+
+  GH_REPO='example-org/example'
+  export GH_REPO
+  run_exec_in "$case_repo" pr list
+  assert_status 77 || return 1
+  assert_combined_contains 'env -u GH_REPO' || return 1
+  unset GH_REPO
+  assert_file_not_contains "$fake_state/calls.log" 'pr checkout' || return 1
+  assert_file_not_contains "$fake_state/calls.log" '/tmp/body.md'
+}
+
+test_exec_drops_only_the_benign_quotepath_git_env() {
+  setup_case
+  make_repo example-org
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotePath GIT_CONFIG_VALUE_0=false
+  export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+  run_exec_in "$case_repo" pr env-check
+  assert_status 0 || return 1
+  assert_file_contains "$fake_state/calls.log" 'pr env-check' || return 1
+
+  for hostile in \
+    'credential.helper|!echo' \
+    'core.sshCommand|ssh' \
+    'url.https://evil.invalid/.insteadOf|https://github.com/' \
+    'core.quotePath|maybe'; do
+    GIT_CONFIG_KEY_0=${hostile%%|*}
+    GIT_CONFIG_VALUE_0=${hostile#*|}
+    export GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+    : >"$fake_state/calls.log"
+    run_exec_in "$case_repo" pr env-check
+    assert_status 77 || return 1
+    assert_combined_contains 'Git context override present' || return 1
+    assert_file_not_contains "$fake_state/calls.log" 'pr env-check' || return 1
+  done
+
+  # A second pair or a larger count stays refused even when pair 0 is benign.
+  GIT_CONFIG_KEY_0=core.quotePath GIT_CONFIG_VALUE_0=true GIT_CONFIG_COUNT=2
+  GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1=x
+  export GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_COUNT GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+  run_exec_in "$case_repo" pr env-check
+  assert_status 77 || return 1
+  GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_COUNT
+  run_exec_in "$case_repo" pr env-check
+  assert_status 77 || return 1
+  assert_combined_contains 'Git context override present' || return 1
+  unset GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+
+  # Other hostile Git context variables are never dropped.
+  unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+  GIT_SSH_COMMAND=true
+  export GIT_SSH_COMMAND
+  run_exec_in "$case_repo" pr env-check
+  assert_status 77 || return 1
+  assert_combined_contains 'Git context override present'
+}
+
 test_exec_accepts_positional_repository_selector_without_origin() {
   setup_case
   # `gh repo view|edit|delete|archive|... [<repository>]` take the repository as
@@ -3169,6 +3277,12 @@ run_test 'generic exec pins the repository and neutralizes local launchers' \
   test_exec_pins_repo_and_neutralizes_local_program_launchers
 run_test 'generic exec rejects GH_REPO environment routing' \
   test_exec_refuses_gh_repo_environment_override
+run_test 'generic exec ignores one leading gh word' \
+  test_exec_ignores_a_leading_gh_word
+run_test 'generic exec refusals name the safe form without echoing arguments' \
+  test_exec_refusals_name_the_safe_form
+run_test 'generic exec drops only the benign core.quotePath Git environment' \
+  test_exec_drops_only_the_benign_quotepath_git_env
 run_test 'generic exec accepts a positional repository selector without an origin' \
   test_exec_accepts_positional_repository_selector_without_origin
 run_test 'generic exec permits only constrained read-only GraphQL' \
