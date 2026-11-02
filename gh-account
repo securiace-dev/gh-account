@@ -127,6 +127,7 @@ rr_xdg_config_snapshot=
 rr_xdg_expected_state=
 rr_xdg_expected_snapshot=
 exec_resolved_repo=
+exec_refusal_hint=
 last_network_failure=
 last_finish_lock_failed=false
 rr_home_config_path=
@@ -157,6 +158,7 @@ preflight proves the routed account identity and restores the prior account.
 repair applies deterministic Git configuration fixes; --interactive may reauth.
 reauth/onboard use native GitHub CLI browser/device authorization explicitly.
 exec temporarily switches under a per-user lock, runs gh, and verifies restore.
+exec takes gh arguments only (no leading "gh"), flags after the subcommand, and file input on stdin.
 git-exec does the same for an HTTPS origin Git transport operation.
 EOF
 }
@@ -503,6 +505,21 @@ git_context_override_names() {
     fi
   done
   printf '%s\n' "$gco_names"
+}
+
+# Agent runners (for example Cursor's shell tool) inject exactly one
+# presentation-only Git setting, GIT_CONFIG_COUNT=1 with core.quotePath=true|false,
+# into every command. core.quotePath only changes how Git prints non-ASCII path
+# names; it cannot influence credentials, remotes, hooks, or routing. Drop that
+# exact triple so it is not inherited by routed commands. Any other GIT_CONFIG_*
+# state (a different key or value, a second pair, COUNT > 1) is left in place
+# and is still refused by assert_safe_git_context.
+scrub_benign_git_config_env() {
+  [ "${GIT_CONFIG_COUNT-}" = 1 ] || return 0
+  [ "${GIT_CONFIG_KEY_0-}" = core.quotePath ] || return 0
+  case "${GIT_CONFIG_VALUE_0-}" in true|false) ;; *) return 0 ;; esac
+  [ "${GIT_CONFIG_KEY_1+x}" != x ] && [ "${GIT_CONFIG_VALUE_1+x}" != x ] || return 0
+  unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 }
 
 assert_safe_git_context() {
@@ -5201,14 +5218,21 @@ gh_command_uses_repository() {
 }
 
 exec_routes_to_host() {
-  [ "${GH_REPO+x}" != x ] || return 1
+  exec_refusal_hint=
+  if [ "${GH_REPO+x}" = x ]; then
+    exec_refusal_hint='GH_REPO is set in the environment; run with env -u GH_REPO'
+    return 1
+  fi
   erh_command=${1:-}
   erh_expect_repo=false
   erh_explicit_repo=false
   exec_resolved_repo=
   for erh_arg in "$@"; do
     if [ "$erh_expect_repo" = true ]; then
-      valid_repository_selector "$erh_arg" || return 1
+      if ! valid_repository_selector "$erh_arg"; then
+        exec_refusal_hint='the repository selector after -R/--repo must be OWNER/REPO (or github.com/OWNER/REPO)'
+        return 1
+      fi
       erh_explicit_repo=true
       erh_expect_repo=false
       continue
@@ -5229,7 +5253,10 @@ exec_routes_to_host() {
         if [ "$erh_command" != api ]; then
           case "$erh_arg" in
             "$host/"*/*) valid_repository_selector "$erh_arg" || return 1; erh_explicit_repo=true ;;
-            *) return 1 ;;
+            *)
+              exec_refusal_hint='an argument contains two or more "/" (it could be a HOST/OWNER/REPO selector or an absolute file path). Pass file input on stdin (--body-file - < file), keep paths relative with at most one "/", and select a repository with -R OWNER/REPO'
+              return 1
+              ;;
           esac
         fi
         ;;
@@ -5255,10 +5282,16 @@ exec_routes_to_host() {
       erh_remote=$?
       case "$erh_remote" in
         0) exec_resolved_repo=$host/$remote_owner/$remote_repo ;;
-        1) [ "$erh_explicit_repo" = true ] || return 1 ;;
+        1)
+          if [ "$erh_explicit_repo" != true ]; then
+            exec_refusal_hint='this worktree has no github.com origin remote; add -R OWNER/REPO after the subcommand'
+            return 1
+          fi
+          ;;
         *) return 1 ;;
       esac
     elif [ "$erh_explicit_repo" != true ]; then
+      exec_refusal_hint='the current directory is not a Git worktree and no repository was selected; cd into the worktree or add -R OWNER/REPO after the subcommand'
       return 1
     fi
   fi
@@ -5371,14 +5404,27 @@ exec_is_safe() {
       case "$eis_second" in ''|-*) return 1 ;; esac
       case "$eis_second" in clone|sync|fork|deploy-key) return 1 ;; esac
       ;;
-    pr) case "$eis_second" in ''|-*|checkout) return 1 ;; esac ;;
-    issue) case "$eis_second" in ''|-*|develop) return 1 ;; esac ;;
+    pr)
+      case "$eis_second" in
+        ''|-*) exec_refusal_hint='put flags after the subcommand, for example: pr list -R OWNER/REPO (not pr -R OWNER/REPO list)'; return 1 ;;
+        checkout) exec_refusal_hint='pr checkout rewrites the local worktree and is refused; use git-exec fetch or a separate worktree'; return 1 ;;
+      esac
+      ;;
+    issue)
+      case "$eis_second" in
+        ''|-*) exec_refusal_hint='put flags after the subcommand, for example: issue list -R OWNER/REPO'; return 1 ;;
+        develop) exec_refusal_hint='issue develop rewrites the local worktree and is refused'; return 1 ;;
+      esac
+      ;;
     secret) [ "$eis_second" = list ] || return 1 ;;
     codespace) [ "$eis_second" = list ] || return 1 ;;
     gist) case "$eis_second" in ''|-*|clone) return 1 ;; esac ;;
     agent-task|attestation|cache|completion|discussion|label|licenses|org|project|release|ruleset|run|search|skill|status|variable|workflow)
       ;;
-    *) return 1 ;;
+    *)
+      exec_refusal_hint='this gh command is not on the reviewed exec allow-list (aliases, extensions, browse, ssh/gpg-key and auth mutations are refused); see: gh-account help'
+      return 1
+      ;;
   esac
   return 0
 }
@@ -5388,14 +5434,20 @@ exec_command() {
   ec_user=$1
   shift
   [ "${1:-}" = -- ] && shift
+  if [ "${1:-}" = gh ]; then
+    printf '%s: note: exec takes gh arguments without the leading "gh"; ignoring it\n' "$program" >&2
+    shift
+  fi
   [ "$#" -gt 0 ] || die_code "$EXIT_USAGE" "exec requires gh arguments"
   validate_login "$ec_user" || die_code "$EXIT_USAGE" "invalid account login"
+  scrub_benign_git_config_env
   assert_safe_git_context
   if ! exec_is_safe "$@"; then
     if command_exists jq && init_findings; then
       add_finding SAFETY.REFUSED error "unsafe authentication, credential, API mutation, or cross-host routing was refused" false true false
       emit_event safety.refused refused action_required "$EXIT_NOPERM" gh-account "$ec_user" "" "$restoration_status"
     fi
+    [ -z "$exec_refusal_hint" ] || printf '%s: hint: %s\n' "$program" "$exec_refusal_hint" >&2
     die_code "$EXIT_NOPERM" "SAFETY.REFUSED: command would bypass the configured host or protected authentication boundary"
   fi
   begin_operation "$ec_user" false false
@@ -5538,6 +5590,7 @@ git_exec_command() {
   [ "${1:-}" = -- ] || die_code "$EXIT_USAGE" "git-exec requires -- before Git arguments"
   shift
   validate_login "$gec_user" || die_code "$EXIT_USAGE" "invalid account login"
+  scrub_benign_git_config_env
   assert_safe_git_context
   git_exec_is_safe "$@" || die_code "$EXIT_NOPERM" "SAFETY.REFUSED: git-exec permits only a reviewed origin fetch, push, or ls-remote"
   gec_repo=$(repository_root "$gec_repo_arg" 2>/dev/null || true)
