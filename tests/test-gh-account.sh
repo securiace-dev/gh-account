@@ -1268,6 +1268,44 @@ test_exec_refuses_cross_host_and_credential_key_operations() {
   assert_file_not_contains "$fake_state/calls.log" 'user/keys/1'
 }
 
+
+test_exec_allows_repo_scoped_secret_set_for_one_repository() {
+  setup_case
+  for allowed_args in \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web' \
+    'secret set --repo=securiace-dev/securiace.com-web NTFY_PUBLISH_URL' \
+    'secret set NTFY_PUBLISH_URL -R securiace-dev/securiace.com-web' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --app actions'; do
+    : >"$fake_state/calls.log"
+    # shellcheck disable=SC2086 # Deliberately split the fixed test vector.
+    run_cli exec bob -- $allowed_args
+    assert_status 0 || return 1
+    assert_file_contains "$fake_state/calls.log" 'secret set' || return 1
+  done
+}
+
+test_exec_refuses_secret_set_outside_the_allowed_repository() {
+  setup_case
+  for unsafe_args in \
+    'secret set NTFY_PUBLISH_URL' \
+    'secret set NTFY_PUBLISH_URL --repo owner/repo' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/other' \
+    'secret set NTFY_PUBLISH_URL --org securiace-dev' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --env production' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --visibility selected' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --body x' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --env-file .env' \
+    'secret delete NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web' \
+    'secret set NTFY_PUBLISH_URL --repo securiace-dev/securiace.com-web --app dependabot'; do
+    : >"$fake_state/calls.log"
+    # shellcheck disable=SC2086 # Deliberately split the fixed test vector.
+    run_cli exec bob -- $unsafe_args
+    assert_status 77 || return 1
+    assert_combined_contains SAFETY.REFUSED || return 1
+    assert_file_not_contains "$fake_state/calls.log" 'secret' || return 1
+  done
+}
+
 test_exec_pins_repo_and_neutralizes_local_program_launchers() {
   setup_case
   make_repo example-org
@@ -3273,6 +3311,10 @@ run_test 'generic exec blocks aliases, extensions, and unknown dispatch' \
 run_test 'generic exec blocks auth mutations' test_exec_blocks_auth_mutations
 run_test 'generic exec rejects cross-host and credential-key operations' \
   test_exec_refuses_cross_host_and_credential_key_operations
+run_test 'generic exec allows repo-scoped secret set for one repository' \
+  test_exec_allows_repo_scoped_secret_set_for_one_repository
+run_test 'generic exec refuses secret set outside the allowed repository' \
+  test_exec_refuses_secret_set_outside_the_allowed_repository
 run_test 'generic exec pins the repository and neutralizes local launchers' \
   test_exec_pins_repo_and_neutralizes_local_program_launchers
 run_test 'generic exec rejects GH_REPO environment routing' \

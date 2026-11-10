@@ -5377,6 +5377,77 @@ api_is_read_only() {
   [ "$airo_expect_method" = false ]
 }
 
+
+# Repo-level Actions secret writes are allowed only for this one repository.
+# Organisation, environment, user, and any other-repo secret mutations stay refused.
+# --body / --env-file are refused so the secret value cannot enter argv or a file flag.
+SECRET_SET_ALLOWED_REPO=securiace-dev/securiace.com-web
+
+secret_set_is_safe() {
+  ss_expect=
+  ss_repo=
+  ss_name=
+  ss_app=
+  for ss_arg in "$@"; do
+    if [ -n "$ss_expect" ]; then
+      case "$ss_expect" in
+        repo)
+          [ "$ss_arg" = "$SECRET_SET_ALLOWED_REPO" ] || return 1
+          [ -z "$ss_repo" ] || return 1
+          ss_repo=$ss_arg
+          ;;
+        app)
+          [ "$ss_arg" = actions ] || return 1
+          [ -z "$ss_app" ] || return 1
+          ss_app=$ss_arg
+          ;;
+        *) return 1 ;;
+      esac
+      ss_expect=
+      continue
+    fi
+    case "$ss_arg" in
+      --repo=*)
+        ss_val=${ss_arg#--repo=}
+        [ "$ss_val" = "$SECRET_SET_ALLOWED_REPO" ] || return 1
+        [ -z "$ss_repo" ] || return 1
+        ss_repo=$ss_val
+        ;;
+      --repo|-R)
+        ss_expect=repo
+        ;;
+      -R?*)
+        ss_val=${ss_arg#-R}
+        [ "$ss_val" = "$SECRET_SET_ALLOWED_REPO" ] || return 1
+        [ -z "$ss_repo" ] || return 1
+        ss_repo=$ss_val
+        ;;
+      --app=*)
+        [ "${ss_arg#--app=}" = actions ] || return 1
+        [ -z "$ss_app" ] || return 1
+        ss_app=actions
+        ;;
+      --app)
+        ss_expect=app
+        ;;
+      --org|--org=*|-o|-o?*|--env|--env=*|-e|-e?*|--repos|--repos=*|-r|-r?*|--visibility|--visibility=*|--no-repos-selected|--env-file|--env-file=*|-f|-f?*|--body|--body=*|-b|-b?*|--no-store|--user|--user=*|--hostname|--hostname=*)
+        return 1
+        ;;
+      --*|-*|'')
+        return 1
+        ;;
+      *)
+        case "$ss_arg" in
+          *[!A-Za-z0-9_]*) return 1 ;;
+        esac
+        [ -z "$ss_name" ] || return 1
+        ss_name=$ss_arg
+        ;;
+    esac
+  done
+  [ -z "$ss_expect" ] && [ -n "$ss_repo" ] && [ -n "$ss_name" ]
+}
+
 exec_is_safe() {
   eis_first=${1:-}
   eis_second=${2:-}
@@ -5416,7 +5487,16 @@ exec_is_safe() {
         develop) exec_refusal_hint='issue develop rewrites the local worktree and is refused'; return 1 ;;
       esac
       ;;
-    secret) [ "$eis_second" = list ] || return 1 ;;
+    secret)
+      case "$eis_second" in
+        list) ;;
+        set)
+          shift 2
+          secret_set_is_safe "$@" || return 1
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
     codespace) [ "$eis_second" = list ] || return 1 ;;
     gist) case "$eis_second" in ''|-*|clone) return 1 ;; esac ;;
     agent-task|attestation|cache|completion|discussion|label|licenses|org|project|release|ruleset|run|search|skill|status|variable|workflow)
